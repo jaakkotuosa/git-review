@@ -19,6 +19,7 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 import argparse
+import curses
 import datetime
 import getpass
 import json
@@ -989,7 +990,83 @@ class CannotParseOpenChangesets(ChangeSetException):
     EXIT_CODE = 33
 
 
-def list_reviews(remote):
+def filter_interactive_list(review_list, filter):
+    filtered = []
+    for r in review_list:
+        match = False
+        for field in r:
+            if filter in field:
+                match = True
+        if match:
+            filtered.append(r)
+
+    return filtered
+
+def render_interactive_list(scr, filter, filtered, index, review_field_width):
+    scr.clear()
+
+    filterText = 'Filter: {}'.format(filter)
+    scr.addstr(0, 0, filterText)
+
+    row = 0
+    for r in filtered:
+        col = 0
+        for field in range(0, len(r)):
+            if check_use_color_output():
+                base = 4 if row == index else 1
+                style = curses.color_pair(base + field)
+            else:
+                style = curses.A_REVERSE if row == index else 0
+            pad = ''
+            if field < 2:
+                pad = ' ' * (review_field_width[field] - len(r[field]))
+            scr.addstr(1 + row, col, pad + r[field], style)
+            col = col + review_field_width[field] + 2
+        row = row + 1
+    scr.move(0, len(filterText))
+    scr.refresh()
+
+def interactive_list_main(scr, review_list, review_field_width):
+    index = 0
+    filter = ''
+
+    curses.cbreak()
+    curses.noecho()
+    scr.keypad(1)
+
+    curses.init_pair(1, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)
+
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
+
+    while True:
+        filtered = filter_interactive_list(review_list, filter)
+        index = min(len(filtered) - 1, index)
+        render_interactive_list(scr, filter, filtered, index, review_field_width)
+
+        key = scr.getch()
+        if key == 27:
+            scr.nodelay(True)
+            key2 = scr.getch()
+            if key2 == -1:
+                # really a esc, not alt
+                break
+        elif key == curses.KEY_ENTER or key == 10 or key == 13:
+            return filtered[index][0]
+        elif key == curses.KEY_UP:
+            index = max(0, index - 1)
+        elif key == curses.KEY_DOWN:
+            index = index + 1
+        elif key == curses.KEY_BACKSPACE:
+            filter = filter[:-1]
+        else:
+            filter = filter + unichr(key)
+
+
+def list_reviews(remote, interactive, author):
     remote_url = get_remote_url(remote)
     reviews = query_reviews(remote_url,
                             exception=CannotQueryOpenChangesets,
@@ -997,7 +1074,7 @@ def list_reviews(remote):
 
     if not reviews:
         print("No pending reviews")
-        return
+        return None
 
     REVIEW_FIELDS = ('number', 'branch', 'subject')
     FIELDS = range(len(REVIEW_FIELDS))
@@ -1010,7 +1087,10 @@ def list_reviews(remote):
     review_field_format = ["%*s", "%*s", "%*s"]
     review_field_justify = [+1, +1, -1]  # +1 is justify to right
 
-    review_list = [[r[f] for f in REVIEW_FIELDS] for r in reviews]
+    review_list = []
+    for r in reviews:
+        if not author or r['owner']['username'] == author:
+            review_list.append([r[f] for f in REVIEW_FIELDS])
     review_field_width = dict()
     # assume last field is longest and may exceed the console width in which
     # case using the maximum value will result in extra blank lines appearing
@@ -1028,6 +1108,10 @@ def list_reviews(remote):
     review_field_width = [
         review_field_width[i] * review_field_justify[i]
         for i in FIELDS]
+
+    if interactive:
+        return curses.wrapper(interactive_list_main, review_list, review_field_width)
+
     for review_value in review_list:
         # At this point we have review_field_format
         # like "%*s %*s %*s" and we need to supply
@@ -1038,10 +1122,12 @@ def list_reviews(remote):
         formatted_fields = []
         for (width, value) in zip(review_field_width, review_value):
             formatted_fields.extend([width, value.encode('utf-8')])
+
         print(review_field_format % tuple(formatted_fields))
+
     print("Found %d items for review" % len(reviews))
 
-    return 0
+    return None
 
 
 class CannotQueryPatchSet(CommandFailed):
@@ -1414,6 +1500,10 @@ def _main():
                              "master on successful submission")
     parser.add_argument("-l", "--list", dest="list", action="store_true",
                         help="List available reviews for the current project")
+    parser.add_argument("-a", "--listauthor", dest="list_author",
+                        help="List only reviews for given author")
+    parser.add_argument("-L", "--listinteractive", dest="list_interactive", action="store_true",
+                        help="List available reviews for the current project, interactive ui")
     parser.add_argument("-y", "--yes", dest="yes", action="store_true",
                         help="Indicate that you do, in fact, understand if "
                              "you are submitting more than one patch")
@@ -1447,6 +1537,8 @@ def _main():
                         update=False,
                         setup=False,
                         list=False,
+                        list_interactive=False,
+                        list_author='',
                         yes=False)
     try:
         (top_dir, git_dir) = git_directories()
@@ -1498,6 +1590,15 @@ def _main():
     if options.color:
         set_color_output(options.color)
 
+    if options.list:
+        list_reviews(remote, False, options.list_author)
+        return
+    elif options.list_interactive:
+        options.changeidentifier = list_reviews(remote, True, options.list_author)
+        if not options.changeidentifier:
+            return
+        options.download = True
+
     if options.changeidentifier:
         if options.compare:
             compare_review(options.changeidentifier,
@@ -1514,9 +1615,6 @@ def _main():
                 cherrypick_review("-n")
             if options.cherrypickindicate:
                 cherrypick_review("-x")
-        return
-    elif options.list:
-        list_reviews(remote)
         return
 
     if options.custom_script:
